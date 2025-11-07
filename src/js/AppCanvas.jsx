@@ -3,6 +3,8 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { useGLTF } from '@react-three/drei'
 import { JEELIZFACEFILTER, NN_4EXPR } from 'facefilter'
 import { JeelizThreeFiberHelper } from './contrib/faceFilter/JeelizThreeFiberHelper.js'
+import { SelfieSegmentation } from '@mediapipe/selfie_segmentation'
+import { Camera } from '@mediapipe/camera_utils'
 
 // ====================== CONFIG ======================
 const _maxFacesDetected = 1
@@ -11,8 +13,10 @@ let _expressions = null
 
 // ====================== MODEL CONFIG ======================
 const modelPositions = {
-  hat: [0, 0.7, 0.6],
-  glass: [-0.1, 0.4, 0.6],
+  hat: [0, 0.7, 0.6, 0],
+  glass: [-0.1, 0.4, 0.6, 0],
+  burger_king: [0, 1.2, 0.6, 1],
+  // <modelName>: [x, y, z, inverted?],
 }
 
 const listOfAvailableModels = Object.keys(modelPositions)
@@ -20,21 +24,15 @@ const listOfAvailableModels = Object.keys(modelPositions)
 // ====================== GENERIC MODEL LOADER ======================
 const FaceModel = ({ modelName }) => {
   const { scene } = useGLTF(`/models/${modelName}.glb`)
-  const position = modelPositions[modelName] || [0, 0, 0]
+  const position = modelPositions[modelName] ? modelPositions[modelName].slice(0, 3) : [0, 1, 0]
+  const rotation = modelPositions[modelName]?.[3] ? [0, Math.PI, 0] : [0, 0, 0]
 
-  return (
-    <primitive
-      object={scene}
-      scale={0.55}
-      position={position}
-    />
-  )
+  return <primitive object={scene} scale={0.55} position={position} rotation={rotation} />
 }
 
 // ====================== FACE FOLLOWER ======================
 const FaceFollower = ({ faceIndex, expression, modelName }) => {
   const objRef = useRef()
-  const mouthOpenRef = useRef()
   const mouthSmileRef = useRef()
 
   useEffect(() => {
@@ -42,11 +40,6 @@ const FaceFollower = ({ faceIndex, expression, modelName }) => {
   }, [faceIndex])
 
   useFrame(() => {
-    if (mouthOpenRef.current) {
-      const s0 = Math.max(0.001, expression.mouthOpen)
-      mouthOpenRef.current.scale.set(s0, 1, s0)
-    }
-
     if (mouthSmileRef.current) {
       const s1 = Math.max(0.001, expression.mouthSmile)
       mouthSmileRef.current.scale.set(s1, 1, s1)
@@ -57,19 +50,21 @@ const FaceFollower = ({ faceIndex, expression, modelName }) => {
     <object3D ref={objRef}>
       <FaceModel modelName={modelName} />
 
-      {/* Optional debug mouth indicators */}
-      <mesh ref={mouthOpenRef} rotation={[Math.PI / 2, 0, 0]} position={[0, -0.2, 0.2]}>
-        <cylinderGeometry args={[0.3, 0.3, 1, 32]} />
-        <meshBasicMaterial color={0xff0000} />
-      </mesh>
-
-      <mesh ref={mouthSmileRef} rotation={[Math.PI / 2, 0, 0]} position={[0, -0.2, 0.2]}>
-        <cylinderGeometry args={[0.5, 0.5, 1, 32, 1, false, -Math.PI / 2, Math.PI]} />
+      {/* Optional debug mouth smile indicator */}
+      <mesh
+        ref={mouthSmileRef}
+        rotation={[Math.PI / 2, 0, 0]}
+        position={[0, -0.2, 0.2]}
+      >
+        <cylinderGeometry
+          args={[0.5, 0.5, 1, 32, 1, false, -Math.PI / 2, Math.PI]}
+        />
         <meshBasicMaterial color={0xff0000} />
       </mesh>
     </object3D>
   )
 }
+
 
 // ====================== CAMERA GRABBER ======================
 let _threeFiber = null
@@ -89,12 +84,70 @@ const compute_sizing = () => {
   return { width, height, top, left }
 }
 
+// ====================== BACKGROUND REMOVER ======================
+const BackgroundRemover = ({ videoRef, outputRef, backgroundVideoRef }) => {
+  useEffect(() => {
+    if (!videoRef.current || !outputRef.current) return
+
+    const selfieSegmentation = new SelfieSegmentation({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
+    })
+
+    selfieSegmentation.setOptions({
+      modelSelection: 1, // 0 = general, 1 = landscape
+      selfieMode: true, // mirror horizontally
+    })
+
+    const ctx = outputRef.current.getContext('2d')
+
+    selfieSegmentation.onResults((results) => {
+      const { width, height } = outputRef.current
+      ctx.clearRect(0, 0, width, height)
+
+      // Draw the segmentation mask first
+      ctx.drawImage(results.segmentationMask, 0, 0, width, height)
+
+      // Keep only the person (invert logic)
+      ctx.globalCompositeOperation = 'source-in'
+      ctx.drawImage(results.image, 0, 0, width, height)
+
+      // Draw background behind the person
+      ctx.globalCompositeOperation = 'destination-over'
+      if (backgroundVideoRef.current) {
+        ctx.drawImage(backgroundVideoRef.current, 0, 0, width, height)
+      }
+
+      // Reset composite operation
+      ctx.globalCompositeOperation = 'source-over'
+    })
+
+    const camera = new Camera(videoRef.current, {
+      onFrame: async () => {
+        await selfieSegmentation.send({ image: videoRef.current })
+      },
+      width: 640,
+      height: 480,
+    })
+    camera.start()
+
+    return () => {
+      camera.stop()
+    }
+  }, [videoRef, outputRef, backgroundVideoRef])
+
+  return null
+}
+
 // ====================== MAIN COMPONENT ======================
 const AppCanvas = () => {
   const [modelToBeLoaded, setModelToBeLoaded] = useState('hat')
   const [sizing, setSizing] = useState(compute_sizing())
   const [isInitialized] = useState(true)
   const faceFilterCanvasRef = useRef(null)
+  const webcamRef = useRef(null)
+  const backgroundVideoRef = useRef(null)
+  const outputCanvasRef = useRef(null)
   let _timerResize = null
 
   // initialize expression state
@@ -197,9 +250,55 @@ const AppCanvas = () => {
         ))}
       </div>
 
-      {/* 3D Canvas */}
+      {/* Background video source */}
+      <video
+        ref={backgroundVideoRef}
+        src="/backgrounds/garden.mp4"
+        autoPlay
+        muted
+        loop
+        playsInline
+        style={{
+          position: 'fixed',
+          bottom: 10,
+          right: 10,
+          width: 200,
+          zIndex: 99
+        }}
+      />
+
+
+      {/* Webcam input (hidden) */}
+      <video
+        ref={webcamRef}
+        autoPlay
+        muted
+        playsInline
+        style={{ display: 'none' }}
+      />
+
+      {/* Output canvas: segmented person + background */}
+      <canvas
+        ref={outputCanvasRef}
+        width={sizing.width}
+        height={sizing.height}
+        style={{
+          position: 'fixed',
+          zIndex: 1,
+          ...sizing,
+        }}
+      />
+
+      {/* MediaPipe background remover */}
+      <BackgroundRemover
+        videoRef={webcamRef}
+        outputRef={outputCanvasRef}
+        backgroundVideoRef={backgroundVideoRef}
+      />
+
+      {/* 3D Canvas (Jeeliz overlays) */}
       <Canvas
-        className='mirrorX'
+        className="mirrorX"
         style={{
           position: 'fixed',
           zIndex: 2,
@@ -217,13 +316,13 @@ const AppCanvas = () => {
         />
       </Canvas>
 
-      {/* Video Canvas */}
+      {/* Jeeliz face filter internal canvas */}
       <canvas
-        className='mirrorX'
+        className="mirrorX"
         ref={faceFilterCanvasRef}
         style={{
           position: 'fixed',
-          zIndex: 1,
+          zIndex: 0,
           ...sizing,
         }}
         width={sizing.width}

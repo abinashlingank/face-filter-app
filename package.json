@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mediapipe/camera_utils": "^0.3.1675466862",
+    "@mediapipe/selfie_segmentation": "^0.1.1675465747",
     "@react-three/drei": "^10.7.6",
     "@react-three/fiber": "^9.4.0",
     "facefilter": "^3.4.3",
